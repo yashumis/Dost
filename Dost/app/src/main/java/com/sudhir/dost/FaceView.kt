@@ -14,7 +14,7 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
 
-val EMOS = setOf("happy", "laugh", "sad", "surprised", "thinking", "love", "calm", "sleepy")
+val EMOS = setOf("happy", "laugh", "sad", "surprised", "thinking", "love", "calm", "sleepy", "angry", "dizzy", "ouch", "asleep")
 
 /** The cartoon face. Draws itself every frame: blinks, looks around, breathes, and moves its mouth with the voice. */
 class FaceView(ctx: Context) : View(ctx) {
@@ -29,6 +29,9 @@ class FaceView(ctx: Context) : View(ctx) {
         }
     var listening = false
     var thinking = false
+    var snoring = false
+    private var shakeUntil = 0L
+    private var lookHoldUntil = 0L
 
     private var level = -1f          // real audio loudness 0..1 (premium voice); -1 = not available
     private var lastPulse = 0L       // start of the current spoken word
@@ -69,7 +72,11 @@ class FaceView(ctx: Context) : View(ctx) {
         "thinking" to floatArrayOf(58f, 66f, 72f, 66f, 86f, 68f, 114f, 58f, 128f, 50f, 142f, 58f),
         "love" to floatArrayOf(58f, 64f, 72f, 56f, 86f, 64f, 114f, 64f, 128f, 56f, 142f, 64f),
         "calm" to floatArrayOf(58f, 68f, 72f, 64f, 86f, 68f, 114f, 68f, 128f, 64f, 142f, 68f),
-        "sleepy" to floatArrayOf(58f, 70f, 72f, 68f, 86f, 70f, 114f, 70f, 128f, 68f, 142f, 70f)
+        "sleepy" to floatArrayOf(58f, 70f, 72f, 68f, 86f, 70f, 114f, 70f, 128f, 68f, 142f, 70f),
+        "asleep" to floatArrayOf(58f, 72f, 72f, 70f, 86f, 72f, 114f, 72f, 128f, 70f, 142f, 72f),
+        "angry" to floatArrayOf(56f, 58f, 72f, 62f, 88f, 74f, 112f, 74f, 128f, 62f, 144f, 58f),
+        "dizzy" to floatArrayOf(58f, 60f, 72f, 54f, 86f, 62f, 114f, 64f, 128f, 54f, 142f, 58f),
+        "ouch" to floatArrayOf(58f, 72f, 72f, 62f, 86f, 66f, 114f, 66f, 128f, 62f, 142f, 72f)
     )
 
     private fun now() = System.currentTimeMillis()
@@ -83,6 +90,30 @@ class FaceView(ctx: Context) : View(ctx) {
 
     /** Called at the start of every spoken word, so the mouth stays in time with the voice. */
     fun pulse() { lastPulse = now() }
+
+    /** Shake the head left-right (for "no no" and when punched). */
+    fun shake(ms: Long) { shakeUntil = now() + ms }
+
+    /** Converts a touch point on this view into face drawing units (0..200). */
+    fun toFace(x: Float, y: Float): FloatArray {
+        val s = min(width, height) / 200f
+        if (s <= 0f) return floatArrayOf(100f, 100f)
+        return floatArrayOf((x - (width - 200f * s) / 2f) / s, (y - (height - 200f * s) / 2f) / s)
+    }
+
+    /** Eyes look at a finger touching this view. */
+    fun lookAtView(x: Float, y: Float) {
+        val f = toFace(x, y)
+        lookDir((f[0] - 100f) / 60f, (f[1] - 92f) / 60f)
+    }
+
+    /** Eyes look in a direction (-1..1). */
+    fun lookDir(dx: Float, dy: Float) {
+        lookTX = dx.coerceIn(-1f, 1f)
+        lookTY = dy.coerceIn(-1f, 1f)
+        lookHoldUntil = now() + 1200
+        nextLook = lookHoldUntil
+    }
 
     /** Real loudness of the voice (premium voice). */
     fun audioLevel(l: Float) { level = l }
@@ -105,8 +136,10 @@ class FaceView(ctx: Context) : View(ctx) {
         c.drawOval(r, fill)
 
         val bounce = if (t < bounceUntil) sin(t / 45.0).toFloat() * 4f else 0f
-        val breathe = sin(t / 700.0).toFloat() * 1.3f
-        c.translate(0f, bounce + breathe)
+        val breathe = sin(t / (if (emotion == "asleep") 1100.0 else 700.0)).toFloat() * (if (emotion == "asleep") 2.5f else 1.3f)
+        val shake = if (t < shakeUntil) sin(t / 35.0).toFloat() * 7f else 0f
+        c.translate(shake, bounce + breathe)
+        if (emotion == "dizzy") c.rotate(sin(t / 140.0).toFloat() * 9f, 100f, 100f)
 
         // listening ring
         if (listening) {
@@ -131,12 +164,16 @@ class FaceView(ctx: Context) : View(ctx) {
         c.drawPath(path, line)
 
         // cheeks
-        fill.color = if (emotion == "love" || emotion == "laugh") 0xAAFF6B70.toInt() else 0x66FF7A7F
+        fill.color = when (emotion) {
+            "angry" -> 0xCCFF3B3B.toInt()
+            "love", "laugh" -> 0xAAFF6B70.toInt()
+            else -> 0x66FF7A7F
+        }
         r.set(42f, 116f, 72f, 133f); c.drawOval(r, fill)
         r.set(128f, 116f, 158f, 133f); c.drawOval(r, fill)
 
         // eyes wander like a living face
-        if (t > nextLook) {
+        if (t > nextLook && t > lookHoldUntil) {
             lookTX = (Math.random() * 2 - 1).toFloat() * 0.8f
             lookTY = (Math.random() * 2 - 1).toFloat() * 0.5f
             if (talking || listening) { lookTX *= 0.3f; lookTY *= 0.3f }
@@ -176,6 +213,16 @@ class FaceView(ctx: Context) : View(ctx) {
             c.drawText("♥", 28f, 52f - f * 0.4f, text)
             c.drawText("♥", 170f, 44f - f * 0.3f, text)
         }
+        if (snoring) {
+            text.color = Color.WHITE
+            for (i in 0..2) {
+                val ph = ((t / 900.0 + i / 3.0) % 1.0).toFloat()
+                text.textSize = 14f + ph * 16f
+                text.alpha = (255 * (1f - ph)).toInt()
+                c.drawText("Z", 150f + ph * 30f + i * 4f, 60f - ph * 50f, text)
+            }
+            text.alpha = 255
+        }
         if (thinking) {
             fill.color = Color.WHITE
             for (i in 0..2) {
@@ -188,6 +235,43 @@ class FaceView(ctx: Context) : View(ctx) {
     }
 
     private fun drawEye(c: Canvas, cx: Float, cy: Float, open: Float) {
+        val left = cx < 100f
+        when (emotion) {
+            "asleep" -> {
+                line.color = dark
+                line.strokeWidth = 4.5f
+                path.reset(); path.moveTo(cx - 12f, cy); path.quadTo(cx, cy + 9f, cx + 12f, cy)
+                c.drawPath(path, line)
+                return
+            }
+            "ouch" -> {
+                line.color = dark
+                line.strokeWidth = 5f
+                path.reset()
+                if (left) { path.moveTo(cx - 11f, cy - 9f); path.lineTo(cx + 9f, cy); path.lineTo(cx - 11f, cy + 9f) }
+                else { path.moveTo(cx + 11f, cy - 9f); path.lineTo(cx - 9f, cy); path.lineTo(cx + 11f, cy + 9f) }
+                c.drawPath(path, line)
+                return
+            }
+            "dizzy" -> {
+                fill.color = Color.WHITE
+                r.set(cx - 15f, cy - 17f, cx + 15f, cy + 17f)
+                c.drawOval(r, fill)
+                line.color = dark
+                line.strokeWidth = 2.6f
+                path.reset()
+                val rot = now() / 120.0 * (if (left) 1 else -1)
+                for (k in 0..34) {
+                    val a = k * 0.5 + rot
+                    val rad = k * 0.38f
+                    val x = cx + (Math.cos(a) * rad).toFloat()
+                    val y = cy + (Math.sin(a) * rad).toFloat()
+                    if (k == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                }
+                c.drawPath(path, line)
+                return
+            }
+        }
         if (emotion == "laugh") {
             line.color = dark
             line.strokeWidth = 5f
@@ -266,6 +350,27 @@ class FaceView(ctx: Context) : View(ctx) {
                 return
             }
             "sad" -> { path.moveTo(76f, 144f); path.quadTo(100f, 126f, 124f, 144f) }
+            "angry" -> {
+                line.strokeWidth = 6f
+                path.moveTo(78f, 142f); path.quadTo(100f, 128f, 122f, 142f)
+            }
+            "dizzy" -> {
+                path.moveTo(78f, 134f)
+                path.cubicTo(88f, 124f, 92f, 144f, 100f, 134f)
+                path.cubicTo(108f, 124f, 112f, 144f, 122f, 134f)
+            }
+            "ouch" -> {
+                fill.color = lip
+                r.set(93f, 127f, 107f, 143f)
+                c.drawOval(r, fill)
+                return
+            }
+            "asleep" -> {
+                fill.color = lip
+                val br = 3.5f + 1.5f * sin(t / 1100.0).toFloat()
+                c.drawCircle(100f, 136f, br, fill)
+                return
+            }
             "thinking" -> { path.moveTo(82f, 138f); path.quadTo(100f, 134f, 118f, 140f) }
             "calm" -> { path.moveTo(80f, 132f); path.quadTo(100f, 142f, 120f, 132f) }
             "sleepy" -> { path.moveTo(86f, 136f); path.quadTo(100f, 140f, 114f, 136f) }

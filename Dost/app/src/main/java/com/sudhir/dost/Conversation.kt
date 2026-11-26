@@ -28,9 +28,10 @@ class Conversation(
     var active = false
         private set
     private var misses = 0
-    private var busy = false
-
-    private fun hindi() = store.language.tag.startsWith("hi")
+    var busy = false
+        private set
+    /** Called whenever the user really says or types something. */
+    var onUserSpoke: () -> Unit = {}
 
     fun toggle() { if (active || busy) stop() else start() }
 
@@ -70,13 +71,14 @@ class Conversation(
                 if (misses >= 2 || err == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
                     active = false
                     face.setEmotion("sleepy", 5000)
-                    show(if (hindi()) "मैं यहीं हूँ, बात करनी हो तो मुझे छू लेना।" else "I'm right here. Tap me when you want to talk.")
+                    show(Lines.get(store, "here"))
                     return@cb
                 }
                 main.postDelayed({ listen() }, 350)
                 return@cb
             }
             misses = 0
+            onUserSpoke()
             ask(text)
         }
     }
@@ -84,7 +86,7 @@ class Conversation(
     /** Send words to the brain (also used for typed messages). */
     fun ask(text: String) {
         busy = true
-        if (!text.startsWith("[")) show(text)
+        if (!text.startsWith("[")) { show(text); onUserSpoke() }
         face.thinking = true
         face.setEmotion("thinking")
         brain.ask(text) { r ->
@@ -100,6 +102,19 @@ class Conversation(
         }
     }
 
+    /** Quick reaction to a touch: a face + a short spoken line in the free voice. */
+    fun react(line: String, emo: String, hold: Long, listenAfter: Boolean = false, after: () -> Unit = {}) {
+        ears.cancel()
+        face.listening = false
+        face.thinking = false
+        face.setEmotion(emo, hold)
+        show(line)
+        voice.speak(line, true) {
+            after()
+            if (active) listen() else if (listenAfter) start()
+        }
+    }
+
     fun greet() {
         ask("[The user just opened you. Greet them warmly in one short line, by name if you know it.]")
     }
@@ -107,7 +122,7 @@ class Conversation(
     fun remind(t: String) {
         ears.cancel()
         face.setEmotion("surprised", 5000)
-        val line = (if (hindi()) "याद दिलाना था: " else "Reminder: ") + t
+        val line = Lines.get(store, "reminder") + t
         show(line)
         voice.speak(line) { if (active) listen() }
     }
@@ -136,7 +151,7 @@ class Conversation(
                         stop()
                         Phone.dial(ctx, hit.second)
                     } else {
-                        val msg = if (hindi()) "$name का नंबर तुम्हारे contacts में नहीं मिला।" else "I couldn't find $name in your contacts."
+                        val msg = Lines.get(store, "nocontact", name)
                         show(msg)
                         voice.speak(msg) { if (active) listen() }
                     }

@@ -25,28 +25,64 @@ class Brain(private val store: Store) {
         }.start()
     }
 
+    private var lastErr = ""
+
     private fun think(userText: String): Reply {
         val key = store.geminiKey.trim()
         if (key.isEmpty()) return Reply(noKeyLine(), "thinking", null)
         val prompt = buildPrompt(userText)
-        var model = store.model.ifBlank { discover(key) }
-        val trySearch = System.currentTimeMillis() > store.noSearchUntil
-        var res = call(key, model, prompt, trySearch)
-        if (res.first == 404) {
-            model = discover(key)
-            res = call(key, model, prompt, trySearch)
+
+        // the model that worked last time first, then the other free "flash" models on this key
+        val models = LinkedHashSet<String>()
+        if (store.model.isNotBlank()) models.add(store.model)
+        models.addAll(discover(key))
+        models.add("gemini-flash-latest")
+        models.add("gemini-flash-lite-latest")
+
+        lastErr = ""
+        var tried = 0
+        for (model in models) {
+            if (tried >= 5) break
+            tried++
+            val trySearch = System.currentTimeMillis() > store.noSearchUntil
+            var text = attempt(key, model, prompt, trySearch)
+            if (text == null && trySearch) {
+                text = attempt(key, model, prompt, false)
+                if (text != null) store.noSearchUntil = System.currentTimeMillis() + 12 * 3600_000L
+            }
+            if (text != null) {
+                store.model = model
+                val r = parse(text)
+                if (!userText.startsWith("[")) store.addHistory("User: $userText")
+                store.addHistory("Friend: ${r.text}")
+                return r
+            }
         }
-        if (res.first != 200 && trySearch) {
-            // free plan may not include search: remember for 12 hours and answer without it
-            store.noSearchUntil = System.currentTimeMillis() + 12 * 3600_000L
-            res = call(key, model, prompt, false)
-        }
-        if (res.first != 200) throw Exception("HTTP " + res.first)
-        val r = parse(extract(res.second))
-        if (!userText.startsWith("[")) store.addHistory("User: $userText")
-        store.addHistory("Friend: ${r.text}")
-        return r
+        throw Exception(lastErr.ifBlank { "no model answered" })
     }
+
+    /** One try. Returns the answer text, or null (and remembers why) when it fails. */
+    private fun attempt(key: String, model: String, prompt: String, search: Boolean): String? {
+        return try {
+            val res = call(key, model, prompt, search)
+            if (res.first != 200) {
+                lastErr = "${res.first}: ${googleMessage(res.second)} ($model)"
+                null
+            } else {
+                val t = extract(res.second)
+                if (t.isBlank()) { lastErr = "empty answer ($model)"; null } else t
+            }
+        } catch (e: UnknownHostException) {
+            throw e
+        } catch (e: Exception) {
+            lastErr = "${e.javaClass.simpleName}: ${e.message ?: ""} ($model)"
+            null
+        }
+    }
+
+    private fun googleMessage(body: String): String = try {
+        JSONObject(body).optJSONObject("error")?.optString("message").orEmpty().take(140)
+    } catch (e: Exception) { body.take(140) }
 
     private fun call(key: String, model: String, prompt: String, search: Boolean): Pair<Int, String> {
         val c = URL("$base/models/$model:generateContent").openConnection() as HttpURLConnection
@@ -73,17 +109,19 @@ class Brain(private val store: Store) {
     }
 
     /** Finds the newest free "flash" model on this key, so the app keeps working when Google renames models. */
-    private fun discover(key: String): String {
+    private fun discover(key: String): List<String> {
         val c = URL("$base/models?pageSize=200").openConnection() as HttpURLConnection
         c.connectTimeout = 15000
         c.readTimeout = 20000
         c.setRequestProperty("x-goog-api-key", key)
         val code = c.responseCode
-        if (code != 200) throw Exception("KEY $code")
+        if (code != 200) {
+            val body = c.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+            throw Exception("KEY $code: ${googleMessage(body)}")
+        }
         val arr = JSONObject(c.inputStream.bufferedReader().use { it.readText() }).optJSONArray("models") ?: JSONArray()
-        var best = ""
-        var bestScore = -1e9
         val skip = listOf("image", "tts", "live", "audio", "embed", "vision", "robotics", "computer", "native")
+        val scored = mutableListOf<Pair<String, Double>>()
         for (i in 0 until arr.length()) {
             val m = arr.optJSONObject(i) ?: continue
             val name = m.optString("name").removePrefix("models/")
@@ -96,18 +134,20 @@ class Brain(private val store: Store) {
             if (name.contains("lite")) score -= 2
             if (name.contains("preview") || name.contains("exp")) score -= 6
             if (name.endsWith("latest")) score += 0.2
-            if (score > bestScore) { bestScore = score; best = name }
+            scored.add(name to score)
         }
-        if (best.isEmpty()) best = "gemini-flash-latest"
-        store.model = best
-        return best
+        return scored.sortedByDescending { it.second }.map { it.first }
     }
 
     private fun extract(json: String): String {
-        val parts = JSONObject(json).getJSONArray("candidates").getJSONObject(0)
-            .getJSONObject("content").getJSONArray("parts")
+        val parts = JSONObject(json).optJSONArray("candidates")?.optJSONObject(0)
+            ?.optJSONObject("content")?.optJSONArray("parts") ?: return ""
         val sb = StringBuilder()
-        for (i in 0 until parts.length()) sb.append(parts.getJSONObject(i).optString("text"))
+        for (i in 0 until parts.length()) {
+            val p = parts.optJSONObject(i) ?: continue
+            if (p.optBoolean("thought")) continue
+            sb.append(p.optString("text"))
+        }
         return sb.toString()
     }
 
@@ -155,20 +195,19 @@ User: $u
 """.trim()
     }
 
-    private fun hindi() = store.language.tag.startsWith("hi")
+    private fun noKeyLine() = Lines.get(store, "nokey")
 
-    private fun noKeyLine() = if (hindi())
-        "अरे, मेरा दिमाग अभी चालू नहीं है! सेटिंग्स में Gemini key डालो, फिर हम खूब बातें करेंगे।"
-    else "My brain isn't switched on yet! Please add your free Gemini key in Settings, then we can chat."
-
+    /** Friendly spoken line + the real reason in [brackets]: shown in the bubble, not spoken. */
     private fun errorLine(e: Exception): String {
         val m = e.message ?: ""
-        return when {
-            e is UnknownHostException -> if (hindi()) "इंटरनेट नहीं मिल रहा, थोड़ी देर में फिर से बोलो।" else "I can't reach the internet right now. Try again in a bit."
-            m.startsWith("KEY") || m.contains("400") || m.contains("403") ->
-                if (hindi()) "मेरी Gemini key सही नहीं लग रही। सेटिंग्स में एक बार चेक करो।" else "My Gemini key doesn't seem right. Please check it in Settings."
-            m.contains("429") -> if (hindi()) "आज बहुत बातें हो गईं, मुझे एक मिनट का आराम दो!" else "We've chatted a lot! Give me a minute's rest."
-            else -> if (hindi()) "उफ़, कुछ गड़बड़ हो गई। फिर से बोलो?" else "Oops, something went wrong. Say that again?"
-        }
+        val line = Lines.get(store, when {
+            e is UnknownHostException -> "nonet"
+            m.startsWith("KEY") || m.contains("API key") || m.startsWith("400") || m.startsWith("403") -> "badkey"
+            m.startsWith("429") -> "tired"
+            else -> "oops"
+        })
+        if (e is UnknownHostException) return line
+        val why = m.replace("[", "(").replace("]", ")").take(180)
+        return "$line\n[$why]"
     }
 }

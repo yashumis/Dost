@@ -60,7 +60,8 @@ class Voice(private val ctx: Context, private val store: Store) {
         d?.invoke()
     }
 
-    fun speak(text: String, done: () -> Unit = {}) {
+    /** free = true always uses the phone's free voice (used for quick reactions, so no credits are spent). */
+    fun speak(text: String, free: Boolean = false, done: () -> Unit = {}) {
         stop()
         pendingDone = done
         val clean = text
@@ -68,7 +69,7 @@ class Voice(private val ctx: Context, private val store: Store) {
             .replace(Regex("[*#_`~]"), "")
             .trim()
         if (clean.isEmpty()) { finish(); return }
-        if (store.premium && store.elevenKey.isNotBlank()) eleven(clean) else google(clean)
+        if (!free && store.premium && store.elevenKey.isNotBlank()) eleven(clean) else google(clean)
     }
 
     private fun google(text: String) {
